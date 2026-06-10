@@ -1,4 +1,4 @@
-// Fetches NSE stock data via Yahoo Finance API (free, no key needed)
+// Fetches NSE stock data via /api/stock (Vercel serverless — no CORS issues)
 // NSE symbols use .NS suffix on Yahoo Finance (e.g. RELIANCE.NS)
 
 export async function fetchStockData(symbol) {
@@ -6,19 +6,20 @@ export async function fetchStockData(symbol) {
     ? symbol.toUpperCase()
     : `${symbol.toUpperCase()}.NS`;
 
-  // Yahoo Finance v8 quote endpoint (via allorigins CORS proxy)
-  const quoteUrl = `https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=1y`;
-  const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(quoteUrl)}`;
+  // Call our own Vercel serverless route which fetches Yahoo Finance server-side
+  const res = await fetch(`/api/stock?symbol=${encodeURIComponent(ticker)}`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || `Server error (${res.status})`);
+  }
 
-  const res = await fetch(proxyUrl);
-  if (!res.ok) throw new Error('Network error fetching stock data');
+  const raw = await res.json();
 
-  const wrapper = await res.json();
-  const raw = JSON.parse(wrapper.contents);
-
-  if (raw.chart?.error) throw new Error(raw.chart.error.description || 'Symbol not found');
+  if (raw.chart?.error) throw new Error(raw.chart.error.description || 'Symbol not found. Check the NSE ticker.');
 
   const result = raw.chart.result[0];
+  if (!result) throw new Error('No data returned for this symbol. Is it a valid NSE ticker?');
+
   const meta = result.meta;
   const quotes = result.indicators.quote[0];
   const timestamps = result.timestamp;
@@ -98,7 +99,7 @@ export async function fetchStockData(symbol) {
 
 // ── SWING HIGH/LOW S/R DETECTION ──────────────────────────────────────────────
 function detectSupportResistance(highs, lows, closes, volumes, currentPrice) {
-  const window = 5; // bars each side
+  const window = 5;
   const swingHighs = [];
   const swingLows = [];
 
@@ -116,7 +117,6 @@ function detectSupportResistance(highs, lows, closes, volumes, currentPrice) {
     if (isSwingLow) swingLows.push({ price: lows[i], idx: i, vol: volumes[i] || 0 });
   }
 
-  // Cluster nearby levels (within 0.8%)
   const clusterLevels = (levels) => {
     const sorted = levels.sort((a, b) => b.price - a.price);
     const clusters = [];
@@ -195,7 +195,6 @@ export function scoreFundamentals(fund, currentPrice) {
   let score = 0;
   let total = 0;
 
-  // P/E Ratio
   if (fund.pe !== null) {
     total++;
     const good = fund.pe > 0 && fund.pe < 35;
@@ -209,7 +208,6 @@ export function scoreFundamentals(fund, currentPrice) {
     });
   }
 
-  // Price vs 200 DMA
   if (fund.twoHundredDayAvg && currentPrice) {
     total++;
     const above = currentPrice > fund.twoHundredDayAvg;
@@ -222,7 +220,6 @@ export function scoreFundamentals(fund, currentPrice) {
     });
   }
 
-  // Price vs 50 DMA
   if (fund.fiftyDayAvg && currentPrice) {
     total++;
     const above = currentPrice > fund.fiftyDayAvg;
@@ -235,7 +232,6 @@ export function scoreFundamentals(fund, currentPrice) {
     });
   }
 
-  // Dividend Yield
   if (fund.dividendYield !== null) {
     total++;
     const good = fund.dividendYield >= 1;
@@ -248,7 +244,6 @@ export function scoreFundamentals(fund, currentPrice) {
     });
   }
 
-  // Beta
   if (fund.beta !== null) {
     total++;
     const good = fund.beta < 1.3;
@@ -261,7 +256,6 @@ export function scoreFundamentals(fund, currentPrice) {
     });
   }
 
-  // P/B Ratio
   if (fund.priceToBook !== null) {
     total++;
     const good = fund.priceToBook > 0 && fund.priceToBook < 5;
