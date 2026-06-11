@@ -89,7 +89,6 @@ export async function fetchStockData(symbol) {
     forwardPE:       rawFPE  != null ? rawFPE  : null,
     priceToBook:     rawPB   != null ? rawPB   : null,
     beta:            rawBeta != null ? rawBeta : null,
-    // Convert dividend yield from decimal to % only if available
     dividendYield:   rawDY   != null && rawDY > 0 ? rawDY * 100 : null,
     eps:             rawEPS  != null ? rawEPS  : null,
     marketCap:       meta.marketCap                ?? null,
@@ -102,6 +101,13 @@ export async function fetchStockData(symbol) {
     currency:        meta.currency                 ?? 'INR',
     sector:          meta.sector                   ?? null,
     industry:        meta.industry                 ?? null,
+    returnOnEquity:  meta.returnOnEquity           ?? null,
+    debtToEquity:    meta.debtToEquity             ?? null,
+    revenueGrowth:   meta.revenueGrowth            ?? null,
+    earningsGrowth:  meta.earningsGrowth           ?? null,
+    currentRatio:    meta.currentRatio             ?? null,
+    profitMargins:   meta.profitMargins            ?? null,
+    operatingMargins:meta.operatingMargins         ?? null,
   };
 
   return {
@@ -374,6 +380,72 @@ export function scoreFundamentals(fund, currentPrice) {
       betaScore = 0.3; betaStatus = 'bad'; betaVerdict = 'High risk / volatile stock';
     }
     add(true, betaScore, { name: 'Beta', value: beta.toFixed(2), status: betaStatus, verdict: betaVerdict });
+  }
+
+  // ── 9. Return on Equity ──────────────────────────────────────────────────
+  if (fund.returnOnEquity != null) {
+    const roe = fund.returnOnEquity * 100;
+    let roeScore, roeStatus, roeVerdict;
+    if (roe >= 20) {
+      roeScore = 1; roeStatus = 'good'; roeVerdict = 'Excellent capital efficiency';
+    } else if (roe >= 12) {
+      roeScore = 0.7; roeStatus = 'good'; roeVerdict = 'Decent return on equity';
+    } else if (roe >= 5) {
+      roeScore = 0.4; roeStatus = 'neutral'; roeVerdict = 'Below-average ROE';
+    } else {
+      roeScore = 0; roeStatus = 'bad'; roeVerdict = 'Poor capital utilisation';
+    }
+    add(true, roeScore, { name: 'ROE', value: roe.toFixed(1) + '%', status: roeStatus, verdict: roeVerdict });
+  }
+
+  // ── 10. Profit Margins ───────────────────────────────────────────────────
+  if (fund.profitMargins != null) {
+    const pm = fund.profitMargins * 100;
+    let pmScore, pmStatus, pmVerdict;
+    if (pm >= 20) {
+      pmScore = 1; pmStatus = 'good'; pmVerdict = 'High profit margins';
+    } else if (pm >= 10) {
+      pmScore = 0.7; pmStatus = 'good'; pmVerdict = 'Healthy margins';
+    } else if (pm >= 5) {
+      pmScore = 0.5; pmStatus = 'neutral'; pmVerdict = 'Thin margins';
+    } else if (pm >= 0) {
+      pmScore = 0.2; pmStatus = 'neutral'; pmVerdict = 'Very thin margins';
+    } else {
+      pmScore = 0; pmStatus = 'bad'; pmVerdict = 'Loss-making operations';
+    }
+    add(true, pmScore, { name: 'Net Margin', value: pm.toFixed(1) + '%', status: pmStatus, verdict: pmVerdict });
+  }
+
+  // ── 11. Revenue Growth ───────────────────────────────────────────────────
+  if (fund.revenueGrowth != null) {
+    const rg = fund.revenueGrowth * 100;
+    let rgScore, rgStatus, rgVerdict;
+    if (rg >= 15) {
+      rgScore = 1; rgStatus = 'good'; rgVerdict = 'Strong revenue growth';
+    } else if (rg >= 8) {
+      rgScore = 0.7; rgStatus = 'good'; rgVerdict = 'Steady revenue growth';
+    } else if (rg >= 0) {
+      rgScore = 0.4; rgStatus = 'neutral'; rgVerdict = 'Slow growth';
+    } else {
+      rgScore = 0; rgStatus = 'bad'; rgVerdict = 'Revenue declining';
+    }
+    add(true, rgScore, { name: 'Rev. Growth', value: (rg >= 0 ? '+' : '') + rg.toFixed(1) + '%', status: rgStatus, verdict: rgVerdict });
+  }
+
+  // ── 12. Debt to Equity ───────────────────────────────────────────────────
+  if (fund.debtToEquity != null) {
+    const de = fund.debtToEquity;
+    let deScore, deStatus, deVerdict;
+    if (de <= 30) {
+      deScore = 1; deStatus = 'good'; deVerdict = 'Very low leverage';
+    } else if (de <= 100) {
+      deScore = 0.7; deStatus = 'good'; deVerdict = 'Manageable debt levels';
+    } else if (de <= 200) {
+      deScore = 0.4; deStatus = 'neutral'; deVerdict = 'Moderate leverage';
+    } else {
+      deScore = 0.1; deStatus = 'bad'; deVerdict = 'High debt burden';
+    }
+    add(true, deScore, { name: 'Debt/Equity', value: de.toFixed(0) + '%', status: deStatus, verdict: deVerdict });
   }
 
   // ── Score calculation ─────────────────────────────────────────────────────

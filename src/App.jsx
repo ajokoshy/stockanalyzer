@@ -1,7 +1,7 @@
 import React, { useState, useCallback, useRef } from 'react';
 import { fetchStockData, scoreFundamentals, formatCurrency, formatVolume, formatPrice } from './utils/stockApi';
 
-const QUICK_PICKS = ['RELIANCE', 'TCS', 'HDFCBANK', 'INFY', 'ICICIBANK', 'BAJFINANCE', 'WIPRO', 'SBIN', 'LTIM'];
+const QUICK_PICKS = ['RELIANCE', 'TCS', 'HDFCBANK', 'INFY', 'ICICIBANK', 'BAJFINANCE', 'WIPRO', 'SBIN'];
 
 // ─────────────────────────────────────────────────────────────────────────────
 export default function App() {
@@ -9,8 +9,6 @@ export default function App() {
   const [data, setData]         = useState(null);
   const [loading, setLoading]   = useState(false);
   const [error, setError]       = useState('');
-  const [aiText, setAiText]     = useState('');
-  const [aiLoading, setAiLoading] = useState(false);
   const inputRef = useRef(null);
 
   const analyze = useCallback(async (sym) => {
@@ -19,11 +17,9 @@ export default function App() {
     setLoading(true);
     setError('');
     setData(null);
-    setAiText('');
     try {
       const result = await fetchStockData(s);
       setData(result);
-      fetchAI(result);
     } catch (e) {
       setError(e.message || 'Failed to fetch. Check symbol and try again.');
     } finally {
@@ -31,41 +27,6 @@ export default function App() {
     }
   }, [symbol]);
 
-  const fetchAI = async (d) => {
-    setAiLoading(true);
-    try {
-      const f  = d.fundamentals;
-      const sr = d.srLevels;
-      const prompt = `You are a senior NSE market analyst. Analyze this stock and give a concise 4-5 sentence swing trading perspective. Cover: (1) price action relative to key MAs and S/R levels, (2) momentum (RSI), (3) fundamental quality, (4) the single most important opportunity or risk right now. Be specific, direct, and actionable. Do not add disclaimers or generic advice.
-
-Symbol: ${d.symbol} — ${f.longName}
-CMP: ₹${d.currentPrice} | Change: ${d.changePct > 0 ? '+' : ''}${d.changePct.toFixed(2)}% today
-RSI(14): ${d.rsi ?? 'N/A'} | Volume ratio: ${d.volumeRatio.toFixed(2)}x avg
-52W Range: ₹${d.week52Low} – ₹${d.week52High} | Position: ${d.week52Pos.toFixed(1)}% of range
-200 DMA: ₹${f.twoHundredDayAvg?.toFixed(0) ?? 'N/A'} | 50 DMA: ₹${f.fiftyDayAvg?.toFixed(0) ?? 'N/A'}
-P/E: ${f.pe?.toFixed(1) ?? 'N/A'} | Forward P/E: ${f.forwardPE?.toFixed(1) ?? 'N/A'} | EPS: ₹${f.eps?.toFixed(2) ?? 'N/A'}
-Beta: ${f.beta?.toFixed(2) ?? 'N/A'} | P/B: ${f.priceToBook?.toFixed(2) ?? 'N/A'} | Div Yield: ${f.dividendYield?.toFixed(2) ?? '0'}%
-Key Resistance: ${sr.resistance.slice(0,3).map(r => '₹' + r.price.toFixed(0)).join(', ') || 'N/A'}
-Key Support: ${sr.support.slice(0,3).map(s => '₹' + s.price.toFixed(0)).join(', ') || 'N/A'}`;
-
-      const resp = await fetch('/api/claude', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 1000,
-          messages: [{ role: 'user', content: prompt }],
-        }),
-      });
-      const json = await resp.json();
-      const text = json.content?.map(b => b.text || '').join('') || '';
-      setAiText(text || 'Analysis unavailable.');
-    } catch {
-      setAiText('AI analysis could not be generated. Ensure ANTHROPIC_API_KEY is set in Vercel environment variables.');
-    } finally {
-      setAiLoading(false);
-    }
-  };
 
   return (
     <div className="app">
@@ -75,7 +36,7 @@ Key Support: ${sr.support.slice(0,3).map(s => '₹' + s.price.toFixed(0)).join('
           <div className="header-logo">NSE</div>
           <div>
             <div className="header-title">Stock Analyzer</div>
-            <div className="header-sub">S/R · Pivots · Fundamentals · AI</div>
+            <div className="header-sub">S/R · Pivots · Fundamentals</div>
           </div>
         </div>
         <div className="header-badges">
@@ -139,7 +100,7 @@ Key Support: ${sr.support.slice(0,3).map(s => '₹' + s.price.toFixed(0)).join('
         {!loading && !data && !error && <EmptyState />}
 
         {data && !loading && (
-          <StockReport data={data} aiText={aiText} aiLoading={aiLoading} />
+          <StockReport data={data} />
         )}
       </main>
 
@@ -166,14 +127,14 @@ function EmptyState() {
       <div className="empty-title">Enter any NSE symbol to begin</div>
       <div className="empty-sub">
         Get real-time price · Swing high/low S/R zones · Classic pivot points ·
-        52-week range · Fundamental scoring · AI trading perspective
+        52-week range · Fundamental scoring
       </div>
     </div>
   );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-function StockReport({ data, aiText, aiLoading }) {
+function StockReport({ data }) {
   const {
     symbol, currentPrice, change, changePct,
     week52High, week52Low, week52Pos,
@@ -352,24 +313,6 @@ function StockReport({ data, aiText, aiLoading }) {
         }
       </Section>
 
-      {/* ── AI Analysis ── */}
-      <Section title="AI Trading Perspective">
-        <div className="ai-panel">
-          <div className="ai-model-tag">
-            <span className="ai-dot-purple" />
-            Claude Sonnet
-          </div>
-          {aiLoading
-            ? (
-              <div className="ai-loading">
-                <div className="ai-pulse"><div /><div /><div /></div>
-                <span>Generating analysis…</span>
-              </div>
-            )
-            : <div className="ai-text">{aiText || 'Analysis will appear here once loaded.'}</div>
-          }
-        </div>
-      </Section>
 
     </div>
   );
