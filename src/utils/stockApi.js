@@ -1,37 +1,40 @@
-// NSE Stock Analyzer — stockApi.js
-// All Yahoo Finance fetching done server-side via /api/stock (no CORS issues)
+// NSE Stock Analyzer — stockApi.js  (v2 final)
+// All Yahoo Finance fetching done server-side via /api/stock (no CORS)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MAIN FETCH
 // ─────────────────────────────────────────────────────────────────────────────
 export async function fetchStockData(symbol) {
-  const clean = symbol.toUpperCase().replace(/\.NS$/, '').replace(/\.BO$/, '');
+  const clean  = symbol.toUpperCase().replace(/\.(NS|BO)$/i, '');
   const ticker = `${clean}.NS`;
 
   const res = await fetch(`/api/stock?symbol=${encodeURIComponent(ticker)}`);
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
-    throw new Error(err.error || `Server error (${res.status}). Try again.`);
+    throw new Error(err.error || `Server error (${res.status}). Please try again.`);
   }
 
   const raw = await res.json();
 
   if (raw.chart?.error) {
-    throw new Error(raw.chart.error.description || 'Symbol not found. Try without exchange suffix (e.g. RELIANCE not RELIANCE.NS).');
+    throw new Error(
+      raw.chart.error.description ||
+      'Symbol not found. Enter the NSE ticker without suffix (e.g. RELIANCE, not RELIANCE.NS).'
+    );
   }
 
   const result = raw.chart?.result?.[0];
   if (!result) throw new Error('No data returned. Verify the NSE ticker symbol.');
 
-  const meta   = result.meta;
-  const q      = result.indicators?.quote?.[0] || {};
-  const closes  = (q.close  || []);
-  const highs   = (q.high   || []);
-  const lows    = (q.low    || []);
-  const volumes = (q.volume || []);
+  const meta      = result.meta;
+  const q         = result.indicators?.quote?.[0] || {};
+  const closes    = q.close  || [];
+  const highs     = q.high   || [];
+  const lows      = q.low    || [];
+  const volumes   = q.volume || [];
   const timestamps = result.timestamp || [];
 
-  // ── Safe arrays (no nulls) ────────────────────────────────────────────────
+  // ── Filtered arrays (remove nulls/non-finite) ─────────────────────────────
   const validCloses  = closes.filter(v => v != null && isFinite(v));
   const validHighs   = highs.filter(v => v != null && isFinite(v));
   const validLows    = lows.filter(v => v != null && isFinite(v));
@@ -41,73 +44,69 @@ export async function fetchStockData(symbol) {
 
   // ── Price ─────────────────────────────────────────────────────────────────
   const currentPrice = meta.regularMarketPrice;
-  const prevClose    = meta.chartPreviousClose ?? meta.regularMarketPreviousClose ?? validCloses[validCloses.length - 2];
-  const change       = safeNum(currentPrice - prevClose);
-  const changePct    = prevClose ? safeNum((change / prevClose) * 100) : 0;
+  const prevClose = meta.chartPreviousClose
+    ?? meta.regularMarketPreviousClose
+    ?? validCloses[validCloses.length - 2]
+    ?? validCloses[validCloses.length - 1];
+  const change    = safeNum(currentPrice - prevClose);
+  const changePct = prevClose ? safeNum((change / prevClose) * 100) : 0;
 
   // ── 52-week range ─────────────────────────────────────────────────────────
   const week52High = meta.fiftyTwoWeekHigh ?? Math.max(...validHighs);
   const week52Low  = meta.fiftyTwoWeekLow  ?? Math.min(...validLows);
-
-  // Clamp 52W position to [0, 100] to handle edge cases
-  const range52 = week52High - week52Low;
-  const week52Pos = range52 > 0
+  const range52    = week52High - week52Low;
+  const week52Pos  = range52 > 0
     ? Math.min(100, Math.max(0, ((currentPrice - week52Low) / range52) * 100))
     : 50;
 
   // ── Volume ────────────────────────────────────────────────────────────────
-  const recentVols = validVolumes.slice(-20);
-  const avgVolume  = recentVols.length > 0
+  const recentVols   = validVolumes.slice(-20);
+  const avgVolume    = recentVols.length > 0
     ? recentVols.reduce((a, b) => a + b, 0) / recentVols.length
     : 0;
-  const latestVolume = volumes[volumes.length - 1] ?? 0;
+  // Use last valid volume (handles market-closed days where latest candle may be null)
+  const latestVolume = [...volumes].reverse().find(v => v != null && v > 0) ?? 0;
   const volumeRatio  = avgVolume > 0 ? safeNum(latestVolume / avgVolume) : 1;
 
   // ── Indicators ────────────────────────────────────────────────────────────
   const rsi    = calculateRSI(validCloses, 14);
   const maData = calculateMovingAverages(validCloses);
-  const srLevels = detectSupportResistance(highs, lows, volumes, currentPrice);
+  const srLevels = detectSupportResistance(highs, lows, volumes, currentPrice, validCloses.length);
 
-  // Pivots from last complete session
+  // Pivots: use last session with valid H/L/C
   const lastH = validHighs[validHighs.length - 1];
   const lastL = validLows[validLows.length - 1];
   const lastC = validCloses[validCloses.length - 1];
   const pivots = calculatePivots(lastH, lastL, lastC);
+  const pivotsValid = pivots.P > 0;
 
-  // ── Fundamentals — BUG FIX: use nullSafe() to distinguish 0 from null ────
-  // Yahoo Finance returns decimals for some ratio fields on Indian stocks.
-  // We must NOT use `|| null` (treats 0 as null). Use explicit null checks.
-  const rawPE   = meta.trailingPE;
-  const rawPB   = meta.priceToBook;
-  const rawBeta = meta.beta;
-  const rawDY   = meta.dividendYield; // already a ratio e.g. 0.012 = 1.2%
-  const rawEPS  = meta.epsTrailingTwelveMonths;
-  const rawFPE  = meta.forwardPE;
-
+  // ── Fundamentals ─────────────────────────────────────────────────────────
   const fundamentals = {
-    pe:              rawPE   != null ? rawPE   : null,
-    forwardPE:       rawFPE  != null ? rawFPE  : null,
-    priceToBook:     rawPB   != null ? rawPB   : null,
-    beta:            rawBeta != null ? rawBeta : null,
-    dividendYield:   rawDY   != null && rawDY > 0 ? rawDY * 100 : null,
-    eps:             rawEPS  != null ? rawEPS  : null,
-    marketCap:       meta.marketCap                ?? null,
-    fiftyDayAvg:     meta.fiftyDayAverage          ?? null,
-    twoHundredDayAvg: meta.twoHundredDayAverage    ?? null,
-    avgVolume:       meta.averageDailyVolume3Month  ?? avgVolume,
-    shortName:       meta.shortName                ?? clean,
-    longName:        meta.longName                 ?? meta.shortName ?? clean,
-    exchange:        meta.exchangeName             ?? 'NSE',
-    currency:        meta.currency                 ?? 'INR',
-    sector:          meta.sector                   ?? null,
-    industry:        meta.industry                 ?? null,
-    returnOnEquity:  meta.returnOnEquity           ?? null,
-    debtToEquity:    meta.debtToEquity             ?? null,
-    revenueGrowth:   meta.revenueGrowth            ?? null,
-    earningsGrowth:  meta.earningsGrowth           ?? null,
-    currentRatio:    meta.currentRatio             ?? null,
-    profitMargins:   meta.profitMargins            ?? null,
-    operatingMargins:meta.operatingMargins         ?? null,
+    pe:               meta.trailingPE               ?? null,
+    forwardPE:        meta.forwardPE                ?? null,
+    priceToBook:      meta.priceToBook              ?? null,
+    beta:             meta.beta                     ?? null,
+    // Yahoo returns dividendYield as decimal (0.015 = 1.5%) — convert to %
+    dividendYield:    (meta.dividendYield != null && meta.dividendYield > 0)
+                        ? meta.dividendYield * 100 : null,
+    eps:              meta.epsTrailingTwelveMonths  ?? null,
+    marketCap:        meta.marketCap                ?? null,
+    fiftyDayAvg:      meta.fiftyDayAverage          ?? null,
+    twoHundredDayAvg: meta.twoHundredDayAverage     ?? null,
+    avgVolume:        meta.averageDailyVolume3Month  ?? avgVolume,
+    shortName:        meta.shortName                ?? clean,
+    longName:         meta.longName ?? meta.shortName ?? clean,
+    exchange:         meta.exchangeName             ?? 'NSE',
+    currency:         meta.currency                 ?? 'INR',
+    sector:           meta.sector                   ?? null,
+    industry:         meta.industry                 ?? null,
+    returnOnEquity:   meta.returnOnEquity           ?? null,
+    debtToEquity:     meta.debtToEquity             ?? null,
+    revenueGrowth:    meta.revenueGrowth            ?? null,
+    earningsGrowth:   meta.earningsGrowth           ?? null,
+    profitMargins:    meta.profitMargins            ?? null,
+    operatingMargins: meta.operatingMargins         ?? null,
+    currentRatio:     meta.currentRatio             ?? null,
   };
 
   return {
@@ -121,6 +120,7 @@ export async function fetchStockData(symbol) {
     week52Pos,
     srLevels,
     pivots,
+    pivotsValid,
     volumeRatio,
     latestVolume,
     avgVolume,
@@ -132,74 +132,98 @@ export async function fetchStockData(symbol) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// SWING HIGH / LOW S/R DETECTION  (fixed: recency initialised, cluster mean price)
+// SWING HIGH / LOW S/R DETECTION
 // ─────────────────────────────────────────────────────────────────────────────
-function detectSupportResistance(highs, lows, volumes, currentPrice) {
-  const WINDOW = 5;       // bars each side
-  const CLUSTER_PCT = 0.012; // 1.2% proximity to merge levels
-  const swingHighs = [];
-  const swingLows  = [];
+function detectSupportResistance(highs, lows, volumes, currentPrice, totalCandles) {
+  const WINDOW      = 5;      // bars each side for swing detection
+  const CLUSTER_PCT = 0.012;  // merge levels within 1.2% of each other
+  const swingHighs  = [];
+  const swingLows   = [];
 
   for (let i = WINDOW; i < highs.length - WINDOW; i++) {
-    const h = highs[i];
-    const l = lows[i];
-    const vol = volumes[i] || 0;
+    const h   = highs[i];
+    const l   = lows[i];
+    const vol = volumes[i] ?? 0;
 
+    // ── Swing High: must be strictly greater than all neighbours ─────────────
     if (h != null && isFinite(h)) {
       let isHigh = true;
-      for (let k = 1; k <= WINDOW; k++) {
-        if ((highs[i - k] ?? 0) >= h || (highs[i + k] ?? 0) >= h) { isHigh = false; break; }
+      for (let k = 1; k <= WINDOW && isHigh; k++) {
+        const left  = highs[i - k];
+        const right = highs[i + k];
+        // Skip comparison if neighbour candle is null (gap/holiday)
+        if (left  != null && isFinite(left)  && left  >= h) isHigh = false;
+        if (right != null && isFinite(right) && right >= h) isHigh = false;
       }
       if (isHigh) swingHighs.push({ price: h, idx: i, vol });
     }
 
+    // ── Swing Low: must be strictly less than all neighbours ─────────────────
     if (l != null && isFinite(l)) {
       let isLow = true;
-      for (let k = 1; k <= WINDOW; k++) {
-        if ((lows[i - k] ?? Infinity) <= l || (lows[i + k] ?? Infinity) <= l) { isLow = false; break; }
+      for (let k = 1; k <= WINDOW && isLow; k++) {
+        const left  = lows[i - k];
+        const right = lows[i + k];
+        if (left  != null && isFinite(left)  && left  <= l) isLow = false;
+        if (right != null && isFinite(right) && right <= l) isLow = false;
       }
       if (isLow) swingLows.push({ price: l, idx: i, vol });
     }
   }
 
+  // ── Cluster nearby levels ─────────────────────────────────────────────────
   const cluster = (levels) => {
-    // Sort price descending so we process top-of-range first
-    const sorted = [...levels].sort((a, b) => b.price - a.price);
+    const sorted   = [...levels].sort((a, b) => b.price - a.price);
     const clusters = [];
 
     for (const lv of sorted) {
-      const match = clusters.find(c => Math.abs(c.price - lv.price) / c.price < CLUSTER_PCT);
+      const match = clusters.find(
+        c => Math.abs(c.price - lv.price) / c.price < CLUSTER_PCT
+      );
       if (match) {
-        // Update cluster mean price weighted by volume
+        // Volume-weighted mean price
         const totalVol = match.vol + lv.vol;
         match.price = totalVol > 0
           ? (match.price * match.vol + lv.price * lv.vol) / totalVol
           : (match.price + lv.price) / 2;
         match.touches++;
         match.vol     = totalVol;
-        match.recency = Math.max(match.recency, lv.idx); // FIX: recency tracked properly
+        match.recency = Math.max(match.recency, lv.idx);
       } else {
-        clusters.push({ price: lv.price, touches: 1, vol: lv.vol, recency: lv.idx }); // FIX: recency initialised
+        clusters.push({ price: lv.price, touches: 1, vol: lv.vol, recency: lv.idx });
       }
     }
 
-    // Score = touches (quality) + recency bonus (relevance)
-    const maxIdx = levels.length > 0 ? Math.max(...levels.map(l => l.idx)) : 1;
-    return clusters
-      .sort((a, b) => (b.touches * 3 + (b.recency / maxIdx) * 2) - (a.touches * 3 + (a.recency / maxIdx) * 2));
+    // Normalise recency against total candle count for stable ranking
+    const norm = totalCandles > 0 ? totalCandles : 1;
+    return clusters.sort(
+      (a, b) =>
+        (b.touches * 3 + (b.recency / norm) * 2) -
+        (a.touches * 3 + (a.recency / norm) * 2)
+    );
   };
 
   return {
-    resistance: cluster(swingHighs).filter(c => c.price > currentPrice * 1.001).slice(0, 5),
-    support:    cluster(swingLows).filter(c => c.price < currentPrice * 0.999).slice(0, 5),
+    resistance: cluster(swingHighs)
+      .filter(c => c.price > currentPrice * 1.001)
+      .slice(0, 5),
+    support: cluster(swingLows)
+      .filter(c => c.price < currentPrice * 0.999)
+      .slice(0, 5),
   };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// PIVOT POINTS (Classic)
+// PIVOT POINTS (Classic floor pivot)
 // ─────────────────────────────────────────────────────────────────────────────
 function calculatePivots(high, low, close) {
-  if (!high || !low || !close) return { P: 0, R1: 0, R2: 0, R3: 0, S1: 0, S2: 0, S3: 0 };
+  // Guard: values must exist and be positive numbers
+  if (high == null || low == null || close == null) {
+    return { P: 0, R1: 0, R2: 0, R3: 0, S1: 0, S2: 0, S3: 0 };
+  }
+  if (!isFinite(high) || !isFinite(low) || !isFinite(close)) {
+    return { P: 0, R1: 0, R2: 0, R3: 0, S1: 0, S2: 0, S3: 0 };
+  }
   const P = (high + low + close) / 3;
   return {
     P:  r(P),
@@ -213,13 +237,12 @@ function calculatePivots(high, low, close) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// RSI — Wilder's smoothed method (correct)
+// RSI — Wilder's smoothing (correct)
 // ─────────────────────────────────────────────────────────────────────────────
 function calculateRSI(closes, period = 14) {
   if (closes.length < period + 1) return null;
   let gains = 0, losses = 0;
 
-  // Seed with simple average of first `period` changes
   for (let i = 1; i <= period; i++) {
     const diff = closes[i] - closes[i - 1];
     if (diff > 0) gains += diff; else losses -= diff;
@@ -227,7 +250,6 @@ function calculateRSI(closes, period = 14) {
   let avgGain = gains / period;
   let avgLoss = losses / period;
 
-  // Wilder smoothing for the rest
   for (let i = period + 1; i < closes.length; i++) {
     const diff = closes[i] - closes[i - 1];
     avgGain = (avgGain * (period - 1) + Math.max(diff, 0)) / period;
@@ -235,12 +257,11 @@ function calculateRSI(closes, period = 14) {
   }
 
   if (avgLoss === 0) return 100;
-  const rs = avgGain / avgLoss;
-  return r(100 - 100 / (1 + rs));
+  return r(100 - 100 / (1 + avgGain / avgLoss));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// MOVING AVERAGES
+// MOVING AVERAGES (SMA)
 // ─────────────────────────────────────────────────────────────────────────────
 function calculateMovingAverages(closes) {
   const sma = (n) => {
@@ -252,229 +273,189 @@ function calculateMovingAverages(closes) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// FUNDAMENTAL SCORER  — Fixed: Indian market PE ranges, null-safe, no penalty
-//                       for missing data, sector-aware PE thresholds
+// FUNDAMENTAL SCORER
+// Rules: Indian market PE norms, null-safe, missing fields skip (no penalty),
+//        12 parameters across valuation / trend / quality / growth / risk
 // ─────────────────────────────────────────────────────────────────────────────
 export function scoreFundamentals(fund, currentPrice) {
-  const items  = [];
+  const items = [];
   let score = 0;
   let total = 0;
 
-  // Helper: only score if value is present and meaningful
-  const add = (present, goodScore, item) => {
-    if (!present) return; // skip missing — don't penalise
+  const add = (goodScore, item) => {
     total++;
     score += goodScore;
     items.push(item);
   };
 
-  // ── 1. P/E Ratio (Indian market context) ─────────────────────────────────
-  // NSE stocks: <25 cheap, 25-50 normal, 50-80 growth premium, >80 expensive
+  // ── 1. P/E Ratio (NSE context) ────────────────────────────────────────────
   if (fund.pe != null) {
     const pe = fund.pe;
-    let peScore, peStatus, peVerdict;
-    if (pe <= 0) {
-      peScore = 0; peStatus = 'bad'; peVerdict = 'Negative / no earnings';
-    } else if (pe <= 25) {
-      peScore = 1; peStatus = 'good'; peVerdict = 'Attractively valued';
-    } else if (pe <= 50) {
-      peScore = 0.8; peStatus = 'good'; peVerdict = 'Fair valuation (NSE norm)';
-    } else if (pe <= 80) {
-      peScore = 0.5; peStatus = 'neutral'; peVerdict = 'Growth premium priced in';
-    } else {
-      peScore = 0.2; peStatus = 'bad'; peVerdict = 'Expensive — needs high growth';
-    }
-    add(true, peScore, { name: 'P/E Ratio', value: pe.toFixed(1) + 'x', status: peStatus, verdict: peVerdict });
+    let s, st, v;
+    if      (pe <= 0)  { s = 0;   st = 'bad';     v = 'Negative / no earnings'; }
+    else if (pe <= 25) { s = 1;   st = 'good';    v = 'Attractively valued'; }
+    else if (pe <= 50) { s = 0.8; st = 'good';    v = 'Fair valuation (NSE norm)'; }
+    else if (pe <= 80) { s = 0.5; st = 'neutral'; v = 'Growth premium priced in'; }
+    else               { s = 0.2; st = 'bad';     v = 'Expensive — needs strong growth'; }
+    add(s, { name: 'P/E Ratio', value: pe.toFixed(1) + 'x', status: st, verdict: v });
   }
 
-  // ── 2. Forward P/E ───────────────────────────────────────────────────────
+  // ── 2. Forward P/E vs Trailing P/E (earnings trend) ──────────────────────
   if (fund.forwardPE != null && fund.pe != null) {
     const improving = fund.forwardPE < fund.pe;
-    add(true, improving ? 0.8 : 0.4, {
+    add(improving ? 0.8 : 0.4, {
       name: 'Forward P/E',
       value: fund.forwardPE.toFixed(1) + 'x',
       status: improving ? 'good' : 'neutral',
-      verdict: improving ? 'Earnings growth expected ↑' : 'Flat/declining earnings outlook',
+      verdict: improving ? 'Earnings growth expected ↑' : 'Flat / declining earnings outlook',
     });
   }
 
-  // ── 3. Price vs 200 DMA (trend health) ────────────────────────────────────
-  if (fund.twoHundredDayAvg != null && currentPrice) {
-    const above = currentPrice > fund.twoHundredDayAvg;
-    const pct = ((currentPrice - fund.twoHundredDayAvg) / fund.twoHundredDayAvg * 100).toFixed(1);
-    add(true, above ? 1 : 0, {
-      name: '200 DMA',
-      value: '₹' + r(fund.twoHundredDayAvg).toLocaleString('en-IN'),
-      status: above ? 'good' : 'bad',
-      verdict: above ? `${pct}% above long-term avg` : `${Math.abs(pct)}% below long-term avg`,
-    });
-  }
-
-  // ── 4. Price vs 50 DMA (medium-term trend) ────────────────────────────────
-  if (fund.fiftyDayAvg != null && currentPrice) {
-    const above = currentPrice > fund.fiftyDayAvg;
-    const pct = ((currentPrice - fund.fiftyDayAvg) / fund.fiftyDayAvg * 100).toFixed(1);
-    add(true, above ? 1 : 0, {
-      name: '50 DMA',
-      value: '₹' + r(fund.fiftyDayAvg).toLocaleString('en-IN'),
-      status: above ? 'good' : 'bad',
-      verdict: above ? `${pct}% above 50-day avg` : `${Math.abs(pct)}% below 50-day avg`,
-    });
-  }
-
-  // ── 5. EPS (positive is key) ─────────────────────────────────────────────
+  // ── 3. EPS — must be positive ─────────────────────────────────────────────
   if (fund.eps != null) {
-    const positive = fund.eps > 0;
-    add(true, positive ? 1 : 0, {
+    const pos = fund.eps > 0;
+    add(pos ? 1 : 0, {
       name: 'EPS (TTM)',
       value: '₹' + fund.eps.toFixed(2),
-      status: positive ? 'good' : 'bad',
-      verdict: positive ? 'Company is profitable' : 'Reporting net loss',
+      status: pos ? 'good' : 'bad',
+      verdict: pos ? 'Company is profitable' : 'Reporting net loss',
     });
   }
 
-  // ── 6. P/B Ratio (Indian context) ────────────────────────────────────────
-  // Banks/NBFCs: 1-4 is normal. IT/FMCG can be 5-20+. Judge carefully.
+  // ── 4. Price vs 200 DMA ───────────────────────────────────────────────────
+  if (fund.twoHundredDayAvg != null && currentPrice != null) {
+    const above  = currentPrice > fund.twoHundredDayAvg;
+    const pctNum = (currentPrice - fund.twoHundredDayAvg) / fund.twoHundredDayAvg * 100;
+    const pct    = Math.abs(pctNum).toFixed(1);
+    add(above ? 1 : 0, {
+      name: '200 DMA',
+      value: formatPrice(fund.twoHundredDayAvg),
+      status: above ? 'good' : 'bad',
+      verdict: above ? `${pct}% above long-term avg` : `${pct}% below long-term avg`,
+    });
+  }
+
+  // ── 5. Price vs 50 DMA ────────────────────────────────────────────────────
+  if (fund.fiftyDayAvg != null && currentPrice != null) {
+    const above  = currentPrice > fund.fiftyDayAvg;
+    const pctNum = (currentPrice - fund.fiftyDayAvg) / fund.fiftyDayAvg * 100;
+    const pct    = Math.abs(pctNum).toFixed(1);
+    add(above ? 1 : 0, {
+      name: '50 DMA',
+      value: formatPrice(fund.fiftyDayAvg),
+      status: above ? 'good' : 'bad',
+      verdict: above ? `${pct}% above 50-day avg` : `${pct}% below 50-day avg`,
+    });
+  }
+
+  // ── 6. P/B Ratio ──────────────────────────────────────────────────────────
   if (fund.priceToBook != null) {
     const pb = fund.priceToBook;
-    let pbScore, pbStatus, pbVerdict;
-    if (pb <= 0) {
-      pbScore = 0; pbStatus = 'bad'; pbVerdict = 'Negative book value';
-    } else if (pb <= 3) {
-      pbScore = 1; pbStatus = 'good'; pbVerdict = 'Good value vs book';
-    } else if (pb <= 8) {
-      pbScore = 0.7; pbStatus = 'good'; pbVerdict = 'Moderate premium to book';
-    } else if (pb <= 20) {
-      pbScore = 0.5; pbStatus = 'neutral'; pbVerdict = 'High premium (asset-light biz)';
-    } else {
-      pbScore = 0.2; pbStatus = 'bad'; pbVerdict = 'Very high premium to book';
-    }
-    add(true, pbScore, { name: 'P/B Ratio', value: pb.toFixed(2) + 'x', status: pbStatus, verdict: pbVerdict });
+    let s, st, v;
+    if      (pb <= 0)  { s = 0;   st = 'bad';     v = 'Negative book value'; }
+    else if (pb <= 3)  { s = 1;   st = 'good';    v = 'Good value vs book'; }
+    else if (pb <= 8)  { s = 0.7; st = 'good';    v = 'Moderate premium to book'; }
+    else if (pb <= 20) { s = 0.5; st = 'neutral'; v = 'High premium (asset-light biz)'; }
+    else               { s = 0.2; st = 'bad';     v = 'Very high premium to book'; }
+    add(s, { name: 'P/B Ratio', value: pb.toFixed(2) + 'x', status: st, verdict: v });
   }
 
-  // ── 7. Dividend Yield (optional — growth stocks have none, not penalised) ─
-  if (fund.dividendYield != null) {
-    const dy = fund.dividendYield;
-    let dyScore, dyStatus, dyVerdict;
-    if (dy >= 3) {
-      dyScore = 1; dyStatus = 'good'; dyVerdict = 'High dividend yield';
-    } else if (dy >= 1) {
-      dyScore = 0.8; dyStatus = 'good'; dyVerdict = 'Steady dividend payer';
-    } else {
-      dyScore = 0.5; dyStatus = 'neutral'; dyVerdict = 'Low dividend (growth focus)';
-    }
-    add(true, dyScore, { name: 'Div. Yield', value: dy.toFixed(2) + '%', status: dyStatus, verdict: dyVerdict });
-  }
-
-  // ── 8. Beta (risk) ────────────────────────────────────────────────────────
-  if (fund.beta != null) {
-    const beta = fund.beta;
-    let betaScore, betaStatus, betaVerdict;
-    if (beta < 0.8) {
-      betaScore = 0.9; betaStatus = 'good'; betaVerdict = 'Defensive stock (low volatility)';
-    } else if (beta <= 1.2) {
-      betaScore = 1; betaStatus = 'good'; betaVerdict = 'Market-correlated volatility';
-    } else if (beta <= 1.8) {
-      betaScore = 0.6; betaStatus = 'neutral'; betaVerdict = 'Above-market volatility';
-    } else {
-      betaScore = 0.3; betaStatus = 'bad'; betaVerdict = 'High risk / volatile stock';
-    }
-    add(true, betaScore, { name: 'Beta', value: beta.toFixed(2), status: betaStatus, verdict: betaVerdict });
-  }
-
-  // ── 9. Return on Equity ──────────────────────────────────────────────────
+  // ── 7. ROE ────────────────────────────────────────────────────────────────
   if (fund.returnOnEquity != null) {
     const roe = fund.returnOnEquity * 100;
-    let roeScore, roeStatus, roeVerdict;
-    if (roe >= 20) {
-      roeScore = 1; roeStatus = 'good'; roeVerdict = 'Excellent capital efficiency';
-    } else if (roe >= 12) {
-      roeScore = 0.7; roeStatus = 'good'; roeVerdict = 'Decent return on equity';
-    } else if (roe >= 5) {
-      roeScore = 0.4; roeStatus = 'neutral'; roeVerdict = 'Below-average ROE';
-    } else {
-      roeScore = 0; roeStatus = 'bad'; roeVerdict = 'Poor capital utilisation';
-    }
-    add(true, roeScore, { name: 'ROE', value: roe.toFixed(1) + '%', status: roeStatus, verdict: roeVerdict });
+    let s, st, v;
+    if      (roe >= 20) { s = 1;   st = 'good';    v = 'Excellent capital efficiency'; }
+    else if (roe >= 12) { s = 0.7; st = 'good';    v = 'Decent return on equity'; }
+    else if (roe >= 5)  { s = 0.4; st = 'neutral'; v = 'Below-average ROE'; }
+    else                { s = 0;   st = 'bad';     v = 'Poor capital utilisation'; }
+    add(s, { name: 'ROE', value: roe.toFixed(1) + '%', status: st, verdict: v });
   }
 
-  // ── 10. Profit Margins ───────────────────────────────────────────────────
+  // ── 8. Net Profit Margin ──────────────────────────────────────────────────
   if (fund.profitMargins != null) {
     const pm = fund.profitMargins * 100;
-    let pmScore, pmStatus, pmVerdict;
-    if (pm >= 20) {
-      pmScore = 1; pmStatus = 'good'; pmVerdict = 'High profit margins';
-    } else if (pm >= 10) {
-      pmScore = 0.7; pmStatus = 'good'; pmVerdict = 'Healthy margins';
-    } else if (pm >= 5) {
-      pmScore = 0.5; pmStatus = 'neutral'; pmVerdict = 'Thin margins';
-    } else if (pm >= 0) {
-      pmScore = 0.2; pmStatus = 'neutral'; pmVerdict = 'Very thin margins';
-    } else {
-      pmScore = 0; pmStatus = 'bad'; pmVerdict = 'Loss-making operations';
-    }
-    add(true, pmScore, { name: 'Net Margin', value: pm.toFixed(1) + '%', status: pmStatus, verdict: pmVerdict });
+    let s, st, v;
+    if      (pm >= 20) { s = 1;   st = 'good';    v = 'High profit margins'; }
+    else if (pm >= 10) { s = 0.7; st = 'good';    v = 'Healthy margins'; }
+    else if (pm >= 5)  { s = 0.5; st = 'neutral'; v = 'Thin but positive margins'; }
+    else if (pm >= 0)  { s = 0.2; st = 'neutral'; v = 'Very thin margins'; }
+    else               { s = 0;   st = 'bad';     v = 'Loss-making operations'; }
+    add(s, { name: 'Net Margin', value: pm.toFixed(1) + '%', status: st, verdict: v });
   }
 
-  // ── 11. Revenue Growth ───────────────────────────────────────────────────
+  // ── 9. Revenue Growth ─────────────────────────────────────────────────────
   if (fund.revenueGrowth != null) {
     const rg = fund.revenueGrowth * 100;
-    let rgScore, rgStatus, rgVerdict;
-    if (rg >= 15) {
-      rgScore = 1; rgStatus = 'good'; rgVerdict = 'Strong revenue growth';
-    } else if (rg >= 8) {
-      rgScore = 0.7; rgStatus = 'good'; rgVerdict = 'Steady revenue growth';
-    } else if (rg >= 0) {
-      rgScore = 0.4; rgStatus = 'neutral'; rgVerdict = 'Slow growth';
-    } else {
-      rgScore = 0; rgStatus = 'bad'; rgVerdict = 'Revenue declining';
-    }
-    add(true, rgScore, { name: 'Rev. Growth', value: (rg >= 0 ? '+' : '') + rg.toFixed(1) + '%', status: rgStatus, verdict: rgVerdict });
+    let s, st, v;
+    if      (rg >= 15) { s = 1;   st = 'good';    v = 'Strong revenue growth'; }
+    else if (rg >= 8)  { s = 0.7; st = 'good';    v = 'Steady revenue growth'; }
+    else if (rg >= 0)  { s = 0.4; st = 'neutral'; v = 'Slow growth'; }
+    else               { s = 0;   st = 'bad';     v = 'Revenue declining'; }
+    add(s, {
+      name: 'Rev. Growth',
+      value: (rg >= 0 ? '+' : '') + rg.toFixed(1) + '%',
+      status: st, verdict: v,
+    });
   }
 
-  // ── 12. Debt to Equity ───────────────────────────────────────────────────
+  // ── 10. Debt / Equity ─────────────────────────────────────────────────────
   if (fund.debtToEquity != null) {
-    const de = fund.debtToEquity;
-    let deScore, deStatus, deVerdict;
-    if (de <= 30) {
-      deScore = 1; deStatus = 'good'; deVerdict = 'Very low leverage';
-    } else if (de <= 100) {
-      deScore = 0.7; deStatus = 'good'; deVerdict = 'Manageable debt levels';
-    } else if (de <= 200) {
-      deScore = 0.4; deStatus = 'neutral'; deVerdict = 'Moderate leverage';
-    } else {
-      deScore = 0.1; deStatus = 'bad'; deVerdict = 'High debt burden';
-    }
-    add(true, deScore, { name: 'Debt/Equity', value: de.toFixed(0) + '%', status: deStatus, verdict: deVerdict });
+    const de = fund.debtToEquity; // Yahoo returns as %, e.g. 45.2 = 45.2%
+    let s, st, v;
+    if      (de <= 30)  { s = 1;   st = 'good';    v = 'Very low leverage'; }
+    else if (de <= 100) { s = 0.7; st = 'good';    v = 'Manageable debt levels'; }
+    else if (de <= 200) { s = 0.4; st = 'neutral'; v = 'Moderate leverage'; }
+    else                { s = 0.1; st = 'bad';     v = 'High debt burden'; }
+    add(s, { name: 'Debt/Equity', value: de.toFixed(0) + '%', status: st, verdict: v });
   }
 
-  // ── Score calculation ─────────────────────────────────────────────────────
-  // Minimum 2 data points needed for a verdict; otherwise show "Insufficient data"
-  if (total < 2) {
-    return {
-      items,
-      overall: 'moderate',
-      label: 'Limited Data Available',
-      sub: 'Yahoo Finance returned few fundamental fields for this stock',
-      score: null,
-    };
+  // ── 11. Dividend Yield (optional — growth stocks penalised lightly) ───────
+  if (fund.dividendYield != null) {
+    const dy = fund.dividendYield;
+    let s, st, v;
+    if      (dy >= 3) { s = 1;   st = 'good';    v = 'High dividend yield'; }
+    else if (dy >= 1) { s = 0.8; st = 'good';    v = 'Steady dividend payer'; }
+    else              { s = 0.5; st = 'neutral'; v = 'Low dividend (growth focus)'; }
+    add(s, { name: 'Div. Yield', value: dy.toFixed(2) + '%', status: st, verdict: v });
   }
 
-  const pct = score / total;
+  // ── 12. Beta ──────────────────────────────────────────────────────────────
+  if (fund.beta != null) {
+    const beta = fund.beta;
+    let s, st, v;
+    if      (beta < 0.8)  { s = 0.9; st = 'good';    v = 'Defensive stock (low volatility)'; }
+    else if (beta <= 1.2) { s = 1;   st = 'good';    v = 'Market-correlated volatility'; }
+    else if (beta <= 1.8) { s = 0.6; st = 'neutral'; v = 'Above-market volatility'; }
+    else                  { s = 0.3; st = 'bad';     v = 'High risk / volatile stock'; }
+    add(s, { name: 'Beta', value: beta.toFixed(2), status: st, verdict: v });
+  }
+
+  // ── Score ─────────────────────────────────────────────────────────────────
+  // Need at least 2 data points for a meaningful verdict
+  if (total < 2) return { items: [], overall: 'moderate', label: '', sub: '', score: null };
+
+  const pct     = score / total;
   const overall = pct >= 0.70 ? 'strong' : pct >= 0.45 ? 'moderate' : 'weak';
-  const label   = overall === 'strong' ? 'Fundamentally Strong' : overall === 'moderate' ? 'Mixed Fundamentals' : 'Weak Fundamentals';
-  const sub     = overall === 'strong' ? 'Most key parameters look healthy'
-                : overall === 'moderate' ? 'Some parameters need attention'
+  const label   = overall === 'strong'  ? 'Fundamentally Strong'
+                : overall === 'moderate'? 'Mixed Fundamentals'
+                : 'Weak Fundamentals';
+  const sub     = overall === 'strong'  ? 'Most key parameters look healthy'
+                : overall === 'moderate'? 'Some parameters need attention'
                 : 'Multiple red flags — review carefully';
 
   return { items, overall, label, sub, score: Math.round(pct * 100) };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HELPERS
+// FORMATTING HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
 function r(n) { return Math.round(n * 100) / 100; }
 function safeNum(n) { return isFinite(n) ? r(n) : 0; }
+
+export function formatPrice(p) {
+  if (p == null || !isFinite(p)) return 'N/A';
+  return '₹' + p.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
 
 export function formatCurrency(val) {
   if (val == null || !isFinite(val)) return 'N/A';
@@ -492,9 +473,4 @@ export function formatVolume(v) {
   if (v >= 1e5)  return (v / 1e5).toFixed(2) + ' L';
   if (v >= 1000) return (v / 1000).toFixed(1) + 'K';
   return v.toString();
-}
-
-export function formatPrice(p) {
-  if (p == null || !isFinite(p)) return 'N/A';
-  return '₹' + p.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
